@@ -121,6 +121,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     private String pendingAlertCause = "";
     private String pendingAlertLocation = "";
     private String pendingEmergencyContact = "";
+    private String pendingAlertType = ""; // *** ADDED: To track the type of alert causing the countdown ***
 
 
     @Override
@@ -286,7 +287,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     }
     @Override
     public void onSensorChanged(SensorEvent event) {
-        if (isAlertCountdownActive) return;
+        if (isAlertCountdownActive) return; // Don't process new sensor data if already counting down
         if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
             float x = event.values[0]; float y = event.values[1]; float z = event.values[2];
             float acceleration = (float) Math.sqrt(x * x + y * y + z * z);
@@ -341,13 +342,13 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     }
     private String getCurrentLocationString() { if (lastKnownLocation != null) { return String.format(Locale.US, "Lat: %.6f, Lng: %.6f (http://maps.google.com/maps?q=%.6f,%.6f)", lastKnownLocation.getLatitude(), lastKnownLocation.getLongitude(), lastKnownLocation.getLatitude(), lastKnownLocation.getLongitude()); } else { return "Location unavailable"; } }
 
-    // --- Fatigue Detection Callback (Handles cancelling countdown if fatigue ends) ---
+    // --- Fatigue Detection Callback (Handles cancelling countdown *only* if fatigue ends *during a fatigue* alert) ---
     @Override
     public void onFatigueDetected(final boolean isFatigued) {
         mainThreadHandler.post(() -> {
-            // If fatigue ends *during* an active countdown, cancel the countdown.
-            if (!isFatigued && isAlertCountdownActive) {
-                Log.i(TAG, "Fatigue ended during countdown. Cancelling alert.");
+            // *** MODIFIED: Only cancel countdown if fatigue ends AND it's a fatigue alert ***
+            if (!isFatigued && isAlertCountdownActive && "Fatigue".equals(pendingAlertType)) {
+                Log.i(TAG, "Fatigue ended during FATIGUE countdown. Cancelling alert.");
                 cancelCountdown("Fatigue Ended"); // This will also stop the alarm
                 return; // Don't process further state changes for this event
             }
@@ -358,16 +359,16 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 return;
             }
 
-            // Standard fatigue state change handling
+            // Standard fatigue state change handling (only if no countdown active)
             if (isFatigued) {
                 if (!isFatigueDetectedState) {
                     Log.w(TAG, "Fatigue DETECTED."); updateStatus("Status: Fatigue Detected!", true);
                     setFatigueWarningVisibility(true); playFatigueAlarm(); isFatigueDetectedState = true;
-                    triggerFatigueAlert("Driver Fatigue Detected");
+                    triggerFatigueAlert("Driver Fatigue Detected"); // This starts its own countdown
                 }
             } else { // !isFatigued and countdown is not active
                 if (isFatigueDetectedState) {
-                    Log.i(TAG, "Fatigue ended."); updateStatus("Status: Monitoring", true);
+                    Log.i(TAG, "Fatigue ended (normal)."); updateStatus("Status: Monitoring", true);
                     setFatigueWarningVisibility(false); stopFatigueAlarm(); isFatigueDetectedState = false;
                 }
             }
@@ -376,18 +377,19 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     @Override
     public void onNoFaceDetected() {
         mainThreadHandler.post(() -> {
-            // If no face is detected *during* an active countdown, cancel it.
-            if (isAlertCountdownActive) {
-                Log.i(TAG, "No face detected during countdown. Cancelling alert.");
+            // *** MODIFIED: Only cancel countdown if no face AND it's a fatigue alert ***
+            if (isAlertCountdownActive && "Fatigue".equals(pendingAlertType)) {
+                Log.i(TAG, "No face detected during FATIGUE countdown. Cancelling alert.");
                 cancelCountdown("No Face Detected"); // This will also stop the alarm
                 return;
             }
 
-            // Standard handling if countdown is not active
+            // Standard handling if countdown is not active (or if it's an accident countdown)
             if (isFatigueDetectedState) {
                 Log.i(TAG, "Fatigue ended (No Face)."); updateStatus("Status: Monitoring", true);
                 setFatigueWarningVisibility(false); stopFatigueAlarm(); isFatigueDetectedState = false;
             }
+            // If an accident countdown is active, we do nothing here - let the accident alert proceed.
         });
     }
 
@@ -399,7 +401,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         Log.w(TAG, "Accident Trigger -> Countdown Start. Cause: " + cause);
         updateStatus("Status: ACCIDENT DETECTED!", true);
         sendNotification("Potential Accident!", "Sending alert in " + COUNTDOWN_SECONDS + "s...");
-        startAlertCountdown("Accident", cause, getCurrentLocationString(), emergencyContact);
+        startAlertCountdown("Accident", cause, getCurrentLocationString(), emergencyContact); // Type is "Accident"
     }
     private void triggerFatigueAlert(String cause) {
         long currentTime = System.currentTimeMillis();
@@ -407,68 +409,111 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         String emergencyContact = getEmergencyContact(); if (emergencyContact == null) return;
         Log.w(TAG, "Fatigue Trigger -> Countdown Start. Cause: " + cause);
         sendNotification("Fatigue Alert!", "Sending alert in " + COUNTDOWN_SECONDS + "s...");
-        startAlertCountdown("Fatigue", cause, getCurrentLocationString(), emergencyContact);
+        startAlertCountdown("Fatigue", cause, getCurrentLocationString(), emergencyContact); // Type is "Fatigue"
     }
 
-    // --- Alert Countdown Logic (Removed initial stopFatigueAlarm) ---
+    // --- Alert Countdown Logic ---
     private void startAlertCountdown(String alertType, String cause, String locationString, String emergencyContact) {
         if (isAlertCountdownActive) { Log.w(TAG, "Countdown already active."); return; }
-        isAlertCountdownActive = true; pendingAlertCause = cause; pendingAlertLocation = locationString; pendingEmergencyContact = emergencyContact;
+        isAlertCountdownActive = true;
+        pendingAlertType = alertType; // *** Store the alert type ***
+        pendingAlertCause = cause;
+        pendingAlertLocation = locationString;
+        pendingEmergencyContact = emergencyContact;
 
-        // **REMOVED**: stopFatigueAlarm(); // Keep alarm playing during countdown
+        // Keep alarm playing if it was already playing (e.g., fatigue led to accident)
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setTitle(alertType + " Detected!").setMessage("Sending alert in " + COUNTDOWN_SECONDS + " seconds...")
-                .setCancelable(false).setNegativeButton("CANCEL ALERT", (dialog, which) -> cancelCountdown("User cancelled"));
-        alertCountdownDialog = builder.create(); alertCountdownDialog.show();
+        builder.setTitle(alertType + " Detected!") // Show type in dialog title
+                .setMessage("Sending alert in " + COUNTDOWN_SECONDS + " seconds...")
+                .setCancelable(false) // User must explicitly cancel
+                .setNegativeButton("CANCEL ALERT", (dialog, which) -> cancelCountdown("User cancelled"));
+        alertCountdownDialog = builder.create();
+        alertCountdownDialog.show();
 
         alertCountDownTimer = new CountDownTimer(COUNTDOWN_SECONDS * 1000, 1000) {
             @SuppressLint("SetTextI18n")
-            @Override public void onTick(long millisUntilFinished) { if (alertCountdownDialog != null && alertCountdownDialog.isShowing()) { alertCountdownDialog.setMessage("Sending alert in " + ((millisUntilFinished / 1000) + 1) + " seconds..."); } }
+            @Override public void onTick(long millisUntilFinished) {
+                if (alertCountdownDialog != null && alertCountdownDialog.isShowing()) {
+                    // Ensure the message includes the remaining seconds correctly
+                    alertCountdownDialog.setMessage("Sending alert in " + TimeUnit.MILLISECONDS.toSeconds(millisUntilFinished) + " seconds...");
+                }
+            }
             @Override public void onFinish() {
-                Log.i(TAG, "Countdown finished.");
+                Log.i(TAG, "Countdown finished for " + pendingAlertType); // Log type
                 if (alertCountdownDialog != null && alertCountdownDialog.isShowing()) alertCountdownDialog.dismiss();
-                alertCountdownDialog = null; alertCountDownTimer = null; isAlertCountdownActive = false;
+                alertCountdownDialog = null;
+                alertCountDownTimer = null;
+                isAlertCountdownActive = false; // Mark countdown as finished *before* sending
+
                 long currentTime = System.currentTimeMillis();
-                if (alertType.equals("Accident")) lastAccidentAlertTime = currentTime; else lastFatigueAlertTime = currentTime;
+                // Use the stored pendingAlertType here
+                if ("Accident".equals(pendingAlertType)) {
+                    lastAccidentAlertTime = currentTime;
+                } else if ("Fatigue".equals(pendingAlertType)) {
+                    lastFatigueAlertTime = currentTime;
+                }
 
-                // Perform the alert (SMS/Call)
-                performActualAlertSend(alertType, pendingAlertCause, pendingAlertLocation, pendingEmergencyContact);
+                // Perform the alert (SMS/Call) using stored pending info
+                performActualAlertSend(pendingAlertType, pendingAlertCause, pendingAlertLocation, pendingEmergencyContact);
 
-                // Reset visuals and stop alarm *after* sending, only if fatigue alert
-                if (alertType.equals("Fatigue")) {
+                // Reset visuals and stop alarm *after* sending, only if it was a fatigue alert
+                if ("Fatigue".equals(pendingAlertType)) {
                     resetFatigueVisuals(); // This internally calls stopFatigueAlarm
                 }
+                // For accident alerts, we don't necessarily reset fatigue visuals here,
+                // as fatigue might still be present. The fatigue logic will handle it separately.
+
+                // Clear pending info AFTER use
+                pendingAlertType = "";
+                pendingAlertCause = "";
+                pendingAlertLocation = "";
+                pendingEmergencyContact = "";
             }
         }.start();
     }
-    private void cancelCountdown(String reason) {
-        Log.w(TAG, "Countdown cancelled: " + reason);
-        if (alertCountDownTimer != null) { alertCountDownTimer.cancel(); alertCountDownTimer = null; }
-        if (alertCountdownDialog != null && alertCountdownDialog.isShowing()) { alertCountdownDialog.dismiss(); alertCountdownDialog = null; }
-        isAlertCountdownActive = false; pendingAlertCause = ""; pendingAlertLocation = ""; pendingEmergencyContact = "";
 
-        // Stop the alarm explicitly when countdown is cancelled
+    private void cancelCountdown(String reason) {
+        Log.w(TAG, "Countdown cancelled: " + reason + " (Was for: " + pendingAlertType + ")"); // Log type
+        if (alertCountDownTimer != null) {
+            alertCountDownTimer.cancel();
+            alertCountDownTimer = null;
+        }
+        if (alertCountdownDialog != null && alertCountdownDialog.isShowing()) {
+            alertCountdownDialog.dismiss();
+            alertCountdownDialog = null;
+        }
+        isAlertCountdownActive = false;
+        // Clear pending info on cancellation
+        pendingAlertType = "";
+        pendingAlertCause = "";
+        pendingAlertLocation = "";
+        pendingEmergencyContact = "";
+
+        // Stop the alarm explicitly when countdown is cancelled, regardless of type
         stopFatigueAlarm();
 
         Toast.makeText(this, "Alert Canceled", Toast.LENGTH_SHORT).show();
-        updateStatus("Status: Monitoring", true);
+        updateStatus("Status: Monitoring", true); // Reset status
 
-        // No need to restart alarm here, as the cancellation implies the alert condition ended or was overridden.
-        // If fatigue *truly* persists, the next onFatigueDetected(true) will handle it.
+        // If the cancellation reason wasn't "Fatigue Ended" or "No Face Detected"
+        // while the alert type *was* "Fatigue", we might need to re-evaluate the fatigue state.
+        // However, the continuous checks in onFatigueDetected should handle this.
     }
+
 
     // --- Perform Actual Alert Send ---
     private void performActualAlertSend(String alertType, String cause, String locationString, String emergencyContact) {
         Log.i(TAG, "Sending alert for " + alertType);
         String smsMessage;
-        if (alertType.equals("Accident")) {
+        if ("Accident".equals(alertType)) {
             smsMessage = "Emergency! Potential Accident Detected (" + cause + "). Last known location: " + locationString;
         } else { // Fatigue
             smsMessage = "Alert: Driver Fatigue Detected. Last known location: " + locationString;
         }
         sendEmergencySMS(emergencyContact, smsMessage);
-        if (alertType.equals("Accident")) {
+        // Only call for Accidents
+        if ("Accident".equals(alertType)) {
             makeEmergencyCall(emergencyContact);
         } else {
             Log.i(TAG,"Fatigue alert: Call skipped.");
@@ -506,7 +551,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     private void updateStatus(final String status, boolean animate) { mainThreadHandler.post(() -> { if (statusTextView != null) { if (animate && statusTextView.getVisibility() == View.VISIBLE) { statusTextView.animate().alpha(0f).setDuration(150).setListener(new AnimatorListenerAdapter() { @Override public void onAnimationEnd(Animator animation) { statusTextView.setText(status); statusTextView.animate().alpha(1f).setDuration(150).setListener(null).start(); } }).start(); } else { statusTextView.setAlpha(1f); statusTextView.setText(status); } } }); }
     private void setFatigueWarningVisibility(boolean visible) { mainThreadHandler.post(()-> { if (fatigueWarningTextView != null) { if (visible && fatigueWarningTextView.getVisibility() != View.VISIBLE) { fatigueWarningTextView.setAlpha(0f); fatigueWarningTextView.setVisibility(View.VISIBLE); fatigueWarningTextView.animate().alpha(1f).setDuration(300).setListener(null).start(); } else if (!visible && fatigueWarningTextView.getVisibility() == View.VISIBLE) { fatigueWarningTextView.animate().alpha(0f).setDuration(300).setListener(new AnimatorListenerAdapter() { @Override public void onAnimationEnd(Animator animation) { fatigueWarningTextView.setVisibility(View.GONE); } }).start(); } } }); }
     private void resetFatigueVisuals() { mainThreadHandler.post(() -> {
-        // This is called AFTER a fatigue alert is sent OR if fatigue ends normally
+        // This is called AFTER a fatigue alert is sent OR if fatigue ends normally OR after fatigue countdown cancelled
         if (isFatigueDetectedState || isFatigueAlarmPlaying) { // Check if visuals/alarm need reset
             Log.d(TAG,"Resetting fatigue visuals and stopping alarm.");
             isFatigueDetectedState = false; // Ensure state is false
@@ -538,6 +583,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             else { checkAndRequestPermissions(); }
         } else {
             updateStatus("Status: Set Emergency Contact!", true); Toast.makeText(this, "Emergency contact needed.", Toast.LENGTH_LONG).show();
+            // Still register sensors/location even if contact isn't set, but alerts won't send
             if (areCorePermissionsGranted()) { registerSensorListeners(); if (!requestingLocationUpdates) startLocationUpdates(); }
             else { checkAndRequestPermissions(); }
         }
@@ -550,19 +596,25 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release(); Log.d(TAG, "WakeLock released.");
         }
+        // Cancel any active countdown when the app is paused
         if (isAlertCountdownActive) cancelCountdown("Activity Paused");
-        unregisterSensorListeners(); stopFatigueAlarm(); // Stop alarm if activity is paused
+        unregisterSensorListeners();
+        stopFatigueAlarm(); // Stop alarm if activity is paused
+        // Don't stop location updates on pause, allow background monitoring if needed/configured
     }
     @Override
     protected void onDestroy() {
         super.onDestroy();
         Log.d(TAG, "onDestroy.");
+        // Ensure countdown is cancelled on destroy
         if (isAlertCountdownActive) cancelCountdown("Activity Destroyed");
         if (wakeLock != null && wakeLock.isHeld()) { wakeLock.release(); Log.w(TAG,"WakeLock released in onDestroy."); }
         if (cameraProvider != null) cameraProvider.unbindAll();
         if (cameraExecutor != null) cameraExecutor.shutdown();
         if (fatigueDetector != null) fatigueDetector.stop();
-        unregisterSensorListeners(); stopLocationUpdates(); releaseMediaPlayer();
+        unregisterSensorListeners();
+        stopLocationUpdates(); // Stop location updates when activity is destroyed
+        releaseMediaPlayer();
         mainThreadHandler.removeCallbacksAndMessages(null);
         Log.d(TAG, "Resources released.");
     }
